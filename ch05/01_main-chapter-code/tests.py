@@ -97,3 +97,80 @@ def test_model_files():
 
     check_model_files(base_url="https://openaipublic.blob.core.windows.net/gpt-2/models")
     check_model_files(base_url="https://f001.backblazeb2.com/file/LLMs-from-scratch/gpt2")
+
+
+@pytest.mark.parametrize("source, expected_hosts", [
+    (None, ["openaipublic.blob.core.windows.net", "huggingface.co", "f001.backblazeb2.com"]),
+    ("openai", ["openaipublic.blob.core.windows.net"]),
+    ("hf", ["huggingface.co"]),
+    ("backblaze", ["f001.backblazeb2.com"]),
+])
+def test_gpt2_download_source_order(source, expected_hosts, monkeypatch, tmp_path):
+    from urllib.parse import urlsplit
+
+    pytest.importorskip("tensorflow")
+    from gpt_download import download_and_load_gpt2
+
+    attempted_hosts = []
+
+    def unavailable(url, **kwargs):
+        attempted_hosts.append(urlsplit(url).hostname)
+        raise requests.ConnectionError("Host unavailable")
+
+    monkeypatch.setattr(requests, "get", unavailable)
+    options = {} if source is None else {"source": source}
+    with pytest.raises(requests.ConnectionError):
+        download_and_load_gpt2("124M", tmp_path, **options)
+    assert attempted_hosts == expected_hosts
+
+
+def test_gpt2_download_interruption_preserves_existing_file(monkeypatch, tmp_path):
+    pytest.importorskip("tensorflow")
+    import gpt_download
+
+    destination = tmp_path / "model.ckpt.data-00000-of-00001"
+    original = b"existing-complete-checkpoint"
+    destination.write_bytes(original)
+
+    class InterruptedResponse:
+        headers = {"Content-Length": "100"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield b"partial"
+            raise requests.ConnectionError("Interrupted checkpoint download")
+
+    monkeypatch.setattr(gpt_download.requests, "get", lambda *args, **kwargs: InterruptedResponse())
+    with pytest.raises(requests.ConnectionError, match="Interrupted checkpoint download"):
+        gpt_download.download_file("https://example.com/checkpoint", str(destination))
+    assert destination.read_bytes() == original
+
+
+def test_gpt2_download_urls_use_forward_slashes_on_windows(monkeypatch, tmp_path):
+    import ntpath
+    from types import SimpleNamespace
+
+    pytest.importorskip("tensorflow")
+    import gpt_download
+
+    # Simulate Windows path joining on every CI platform without changing os globally.
+    monkeypatch.setattr(gpt_download, "os", SimpleNamespace(path=ntpath, makedirs=lambda *args, **kwargs: None))
+    attempted_urls = []
+
+    def capture_urls(url, destination, *backup_urls):
+        attempted_urls.extend((url, *backup_urls))
+        raise requests.ConnectionError("Stop before any download")
+
+    monkeypatch.setattr(gpt_download, "download_file", capture_urls)
+    with pytest.raises(requests.ConnectionError, match="Stop before any download"):
+        gpt_download.download_and_load_gpt2("124M", str(tmp_path))
+    assert attempted_urls[0] == "https://openaipublic.blob.core.windows.net/gpt-2/models/124M/checkpoint"
+    assert all("\\" not in url for url in attempted_urls)
